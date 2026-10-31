@@ -1,0 +1,163 @@
+{
+  "entities": {
+    "Appointment": {
+      "title": "Appointment",
+      "description": "Patient booking record for dental procedures with Dr. James Qado",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique appointment identifier"
+        },
+        "patientName": {
+          "type": "string",
+          "description": "Full legal name of the patient",
+          "minLength": 2,
+          "maxLength": 100
+        },
+        "phoneNumber": {
+          "type": "string",
+          "description": "Standardized U.S. mobile phone number (+1)",
+          "minLength": 10,
+          "maxLength": 20
+        },
+        "services": {
+          "type": "array",
+          "description": "List of core dental services selected"
+        },
+        "selectedProducts": {
+          "type": "array",
+          "description": "Optional oral hygiene products attached to the visit record"
+        },
+        "appointmentDate": {
+          "type": "string",
+          "description": "Scheduled date in YYYY-MM-DD format",
+          "maxLength": 10
+        },
+        "timeSlot": {
+          "type": "string",
+          "description": "Scheduled appointment time",
+          "maxLength": 20
+        },
+        "status": {
+          "type": "string",
+          "description": "Status of the appointment",
+          "enum": ["confirmed", "in_chair", "completed", "cancelled"]
+        },
+        "totalCashEstimated": {
+          "type": "number",
+          "description": "Total cash fee expected at visit in USD"
+        },
+        "tcpaConsent": {
+          "type": "boolean",
+          "description": "Mandatory TCPA express consent for automated SMS communications"
+        },
+        "hipaaConsent": {
+          "type": "boolean",
+          "description": "Mandatory acknowledgement of HIPAA privacy practices"
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "Creation timestamp"
+        }
+      },
+      "required": [
+        "patientName",
+        "phoneNumber",
+        "services",
+        "appointmentDate",
+        "timeSlot",
+        "status",
+        "totalCashEstimated",
+        "tcpaConsent",
+        "hipaaConsent"
+      ]
+    },
+    "Patient": {
+      "title": "Patient",
+      "description": "Patient identity record indexed by U.S. phone number",
+      "type": "object",
+      "properties": {
+        "phoneNumber": {
+          "type": "string",
+          "description": "Patient phone number document key",
+          "maxLength": 20
+        },
+        "fullName": {
+          "type": "string",
+          "description": "Patient full legal name",
+          "maxLength": 100
+        },
+        "unpaidCancellationFee": {
+          "type": "boolean",
+          "description": "Flag indicating if the patient has an outstanding $10 late cancellation fee"
+        },
+        "feeAmount": {
+          "type": "number",
+          "description": "Outstanding cancellation fee amount (default 10.00)"
+        },
+        "lastUpdated": {
+          "type": "string",
+          "description": "Last modification timestamp"
+        }
+      },
+      "required": [
+        "phoneNumber",
+        "fullName",
+        "unpaidCancellationFee",
+        "feeAmount"
+      ]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Append-only immutable audit record for HIPAA compliance and operational tracking",
+      "type": "object",
+      "properties": {
+        "timestamp": {
+          "type": "string",
+          "description": "ISO timestamp of event occurrence"
+        },
+        "action": {
+          "type": "string",
+          "description": "Event action type",
+          "enum": ["CREATE", "CANCEL", "MARK_PAID"]
+        },
+        "performedBy": {
+          "type": "string",
+          "description": "Identifier of the actor (patient or staff UID/email)",
+          "maxLength": 100
+        },
+        "patientId": {
+          "type": "string",
+          "description": "Associated patient phone number or record key",
+          "maxLength": 50
+        },
+        "ipAddress": {
+          "type": "string",
+          "description": "Client IP address recorded at request time",
+          "maxLength": 50
+        }
+      },
+      "required": [
+        "timestamp",
+        "action",
+        "performedBy",
+        "patientId"
+      ]
+    }
+  },
+  "firestore": {
+    "/appointments/{appointmentId}": {
+      "schema": "Appointment",
+      "description": "Publicly submittable patient appointments managed by clinic staff"
+    },
+    "/patients/{phoneNumber}": {
+      "schema": "Patient",
+      "description": "Patient records for late cancellation fee lookups"
+    },
+    "/audit_logs/{logId}": {
+      "schema": "AuditLog",
+      "description": "Append-only compliance audit trail"
+    }
+  }
+}

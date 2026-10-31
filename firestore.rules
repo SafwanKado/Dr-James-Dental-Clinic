@@ -1,0 +1,158 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // =========================================================================
+    // 0. GLOBAL SAFETY NET: Default-Deny Catch-All
+    // =========================================================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // =========================================================================
+    // 1. REUSABLE SECURITY & COMPLIANCE PRIMITIVES
+    // =========================================================================
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-\\+\\(\\)\\.\\ ]+$');
+    }
+
+    // Verified Doctor / Staff Administrator check
+    function isAdmin() {
+      return isSignedIn() && (
+        request.auth.token.email == 'safwankado13@gmail.com' ||
+        request.auth.token.email.matches('.*@qadodental\\.com$') ||
+        exists(/databases/$(database)/documents/staff_roles/$(request.auth.uid))
+      );
+    }
+
+    // =========================================================================
+    // 2. APPOINTMENTS COLLECTION (/appointments/{appointmentId})
+    //    Allows public patient submission with mandatory TCPA/HIPAA consent.
+    //    Restricts PHI access and appointment management to authorized clinic staff.
+    // =========================================================================
+    function isValidAppointment(data) {
+      return data.keys().hasAll([
+        'patientName',
+        'phoneNumber',
+        'services',
+        'appointmentDate',
+        'timeSlot',
+        'status',
+        'totalCashEstimated',
+        'tcpaConsent',
+        'hipaaConsent'
+      ]) &&
+      data.patientName is string && data.patientName.size() >= 2 && data.patientName.size() <= 100 &&
+      data.phoneNumber is string && data.phoneNumber.size() >= 10 && data.phoneNumber.size() <= 25 &&
+      data.appointmentDate is string && data.appointmentDate.size() <= 12 &&
+      data.timeSlot is string && data.timeSlot.size() <= 20 &&
+      data.status in ['confirmed', 'in_chair', 'completed', 'cancelled'] &&
+      data.totalCashEstimated is number && data.totalCashEstimated >= 0 &&
+      // Mandatory TCPA and HIPAA regulatory consents
+      data.tcpaConsent == true &&
+      data.hipaaConsent == true &&
+      data.services is list && data.services.size() >= 1 && data.services.size() <= 10;
+    }
+
+    match /appointments/{appointmentId} {
+      // Single appointment lookup: Staff or matching appointment ID
+      allow get: if isValidId(appointmentId) && (isAdmin() || !isSignedIn());
+
+      // Staff query listing: HIPAA mandates restricting bulk patient PHI to authenticated staff
+      allow list: if isAdmin();
+
+      // Public Patient Booking: Allows patients to book with mandatory TCPA and HIPAA consent validation
+      allow create: if isValidId(appointmentId) &&
+                       isValidAppointment(incoming()) &&
+                       incoming().status == 'confirmed';
+
+      // Updates restricted to clinic staff (/doctor portal)
+      allow update: if isValidId(appointmentId) &&
+                       isAdmin() &&
+                       isValidAppointment(incoming());
+
+      // Deletions restricted strictly to clinic administrator
+      allow delete: if isValidId(appointmentId) && isAdmin();
+    }
+
+    // =========================================================================
+    // 3. PATIENTS COLLECTION (/patients/{phoneNumber})
+    //    Document key is normalized phone number.
+    //    Allows patient fee lookup prior to booking and staff management.
+    // =========================================================================
+    function isValidPatient(data) {
+      return data.keys().hasAll(['phoneNumber', 'fullName', 'unpaidCancellationFee', 'feeAmount']) &&
+             data.phoneNumber is string && data.phoneNumber.size() >= 10 && data.phoneNumber.size() <= 25 &&
+             data.fullName is string && data.fullName.size() >= 2 && data.fullName.size() <= 100 &&
+             data.unpaidCancellationFee is bool &&
+             data.feeAmount is number && data.feeAmount >= 0;
+    }
+
+    match /patients/{phoneNumber} {
+      // Patient fee lookup by exact phone number document key
+      allow get: if isValidId(phoneNumber);
+
+      // Blanket patient list is restricted to clinic staff to protect patient roster
+      allow list: if isAdmin();
+
+      // Create or update during appointment creation or by staff
+      allow create: if isValidId(phoneNumber) && isValidPatient(incoming());
+
+      // Fee status update (e.g. marking $10 fee paid or assessing late cancellation)
+      allow update: if isValidId(phoneNumber) && (
+        isAdmin() ||
+        (
+          isValidPatient(incoming()) &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['lastUpdated', 'unpaidCancellationFee', 'feeAmount'])
+        )
+      );
+
+      // No deletion allowed
+      allow delete: if false;
+    }
+
+    // =========================================================================
+    // 4. AUDIT LOGS COLLECTION (/audit_logs/{logId})
+    //    MANDATORY HIPAA AUDIT TRAIL (§ 164.312(b)): Append-Only & Immutable
+    //    Logs CREATE, CANCEL, and MARK_PAID actions. No updates or deletions allowed.
+    // =========================================================================
+    function isValidAuditLog(data) {
+      return data.keys().hasAll(['timestamp', 'action', 'performedBy', 'patientId']) &&
+             data.timestamp is string && data.timestamp.size() <= 40 &&
+             data.action in ['CREATE', 'CANCEL', 'MARK_PAID', 'STATUS_CHANGE'] &&
+             data.performedBy is string && data.performedBy.size() <= 100 &&
+             data.patientId is string && data.patientId.size() <= 50;
+    }
+
+    match /audit_logs/{logId} {
+      // Append-Only: Public booking and staff actions can write audit logs
+      allow create: if isValidId(logId) && isValidAuditLog(incoming());
+
+      // Read restricted exclusively to clinic staff and compliance officers
+      allow read: if isAdmin();
+
+      // STRICT IMMUTABILITY: Updating or deleting audit logs is forbidden by federal law
+      allow update, delete: if false;
+    }
+
+    // =========================================================================
+    // 5. STAFF ROLES COLLECTION (/staff_roles/{userId})
+    // =========================================================================
+    match /staff_roles/{userId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+  }
+}

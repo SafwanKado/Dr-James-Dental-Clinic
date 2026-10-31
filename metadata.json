@@ -1,0 +1,6 @@
+{
+  "name": "Dr. James Qado Dental Clinic",
+  "description": "Contemporary dental clinic website and patient booking portal for Dr. James Qado, featuring services, oral care products, appointment scheduling, and private doctor portal.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
