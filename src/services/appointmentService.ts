@@ -4,7 +4,13 @@
  */
 
 import { getTodayDateString } from '../utils/dateUtils';
-import { createAppointmentInFirestore, updateAppointmentStatusInFirestore } from '../firebase';
+import {
+  auth,
+  createAppointmentInFirestore,
+  updateAppointmentStatusInFirestore,
+  deleteAppointmentInFirestore
+} from '../firebase';
+import { FirestoreAppointment } from '../types/firestore';
 
 export interface BookedProductItem {
   id: string;
@@ -31,6 +37,7 @@ export interface Appointment {
   services: BookedServiceItem[];
   products?: BookedProductItem[];
   totalCash: number;
+  lateFeeIncluded?: number;
   practitioner: string; // 'Dr. James Qado, DDS' or 'Sarah Jenkins, RDH'
   date: string; // YYYY-MM-DD
   timeSlot: string;
@@ -114,6 +121,36 @@ const INITIAL_APPOINTMENTS: Appointment[] = [
   }
 ];
 
+export function mapFirestoreToAppointment(doc: FirestoreAppointment): Appointment {
+  const serviceName = Array.isArray(doc.services) && doc.services.length > 0
+    ? doc.services.map(s => s.name).join(' + ')
+    : 'Dental Visit';
+
+  return {
+    id: doc.id,
+    confirmationCode: doc.confirmationCode || `QAD-${doc.id.slice(-4).toUpperCase()}`,
+    patientName: doc.patientName,
+    email: doc.email,
+    phone: doc.phoneNumber,
+    serviceId: doc.services?.[0]?.id,
+    serviceName,
+    services: doc.services || [],
+    products: doc.selectedProducts || [],
+    totalCash: doc.totalCashEstimated || 0,
+    lateFeeIncluded: doc.lateFeeIncluded || 0,
+    practitioner: doc.practitioner || 'Dr. James Qado, DDS',
+    date: doc.appointmentDate,
+    timeSlot: doc.timeSlot,
+    notes: doc.notes,
+    insuranceProvider: 'Cash Pay',
+    isNewPatient: doc.isNewPatient,
+    tcpaConsent: doc.tcpaConsent,
+    hipaaConsent: doc.hipaaConsent,
+    status: doc.status,
+    createdAt: typeof doc.createdAt === 'string' ? doc.createdAt : new Date().toISOString()
+  };
+}
+
 export function getStoredAppointments(): Appointment[] {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
@@ -135,7 +172,9 @@ export function saveAppointments(appointments: Appointment[]): void {
   }
 }
 
-export function createAppointment(data: Omit<Appointment, 'id' | 'confirmationCode' | 'createdAt' | 'status'>): Appointment {
+export function createAppointment(
+  data: Omit<Appointment, 'id' | 'confirmationCode' | 'createdAt' | 'status'>
+): Appointment {
   const current = getStoredAppointments();
   const randomSuffix = Math.floor(1000 + Math.random() * 9000);
   const newAppointment: Appointment = {
@@ -149,30 +188,28 @@ export function createAppointment(data: Omit<Appointment, 'id' | 'confirmationCo
   const updated = [newAppointment, ...current];
   saveAppointments(updated);
 
-  // Asynchronously persist to Cloud Firestore and emit audit log
-  try {
-    createAppointmentInFirestore({
-      id: newAppointment.id,
-      patientName: newAppointment.patientName,
-      phoneNumber: newAppointment.phone,
-      services: newAppointment.services,
-      selectedProducts: newAppointment.products || [],
-      appointmentDate: newAppointment.date,
-      timeSlot: newAppointment.timeSlot,
-      status: newAppointment.status,
-      totalCashEstimated: newAppointment.totalCash,
-      tcpaConsent: Boolean(newAppointment.tcpaConsent),
-      hipaaConsent: Boolean(newAppointment.hipaaConsent),
-      practitioner: newAppointment.practitioner,
-      notes: newAppointment.notes,
-      confirmationCode: newAppointment.confirmationCode
-    }).catch(err => {
-      // In dev sandbox or without live credentials, local state remains fully preserved
-      console.warn("Firestore sync warning (local cache active):", err);
-    });
-  } catch (err) {
-    console.warn("Firestore initialization notice:", err);
-  }
+  // Persist to Cloud Firestore with HIPAA audit log
+  createAppointmentInFirestore({
+    id: newAppointment.id,
+    patientName: newAppointment.patientName,
+    phoneNumber: newAppointment.phone,
+    email: newAppointment.email,
+    services: newAppointment.services,
+    selectedProducts: newAppointment.products || [],
+    appointmentDate: newAppointment.date,
+    timeSlot: newAppointment.timeSlot,
+    status: newAppointment.status,
+    totalCashEstimated: newAppointment.totalCash,
+    lateFeeIncluded: newAppointment.lateFeeIncluded || 0,
+    tcpaConsent: Boolean(newAppointment.tcpaConsent),
+    hipaaConsent: Boolean(newAppointment.hipaaConsent),
+    practitioner: newAppointment.practitioner,
+    notes: newAppointment.notes,
+    confirmationCode: newAppointment.confirmationCode,
+    isNewPatient: newAppointment.isNewPatient
+  }).catch(err => {
+    console.warn("Firestore appointment sync warning:", err);
+  });
 
   return newAppointment;
 }
@@ -181,6 +218,13 @@ export function updateAppointmentStatus(id: string, status: Appointment['status'
   const current = getStoredAppointments();
   const updated = current.map(item => item.id === id ? { ...item, status } : item);
   saveAppointments(updated);
+
+  if (auth.currentUser) {
+    updateAppointmentStatusInFirestore(id, status).catch(err => {
+      console.warn("Firestore status update warning:", err);
+    });
+  }
+
   return updated;
 }
 
@@ -188,5 +232,12 @@ export function deleteAppointment(id: string): Appointment[] {
   const current = getStoredAppointments();
   const updated = current.filter(item => item.id !== id);
   saveAppointments(updated);
+
+  if (auth.currentUser) {
+    deleteAppointmentInFirestore(id).catch(err => {
+      console.warn("Firestore delete warning:", err);
+    });
+  }
+
   return updated;
 }

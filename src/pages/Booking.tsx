@@ -30,6 +30,7 @@ import { DENTAL_SERVICES, CLINIC_INFO, DentalProduct, DentalService } from '../u
 import { CLINIC_PRODUCTS } from '../services/productService';
 import { getUpcomingDays, TIME_SLOTS, formatDate } from '../utils/dateUtils';
 import { useClinic } from '../context/ClinicContext';
+import { getPatientCancellationFee } from '../firebase';
 
 // Helper to format US phone number (+1 (XXX) XXX-XXXX)
 function formatUSPhoneNumber(value: string): string {
@@ -89,10 +90,11 @@ export const Booking: React.FC = () => {
   const [isNewPatient, setIsNewPatient] = useState<boolean>(true);
   const [notes, setNotes] = useState<string>('');
 
-  // Step 5: Consents
+  // Step 5: Consents & Fee Lookup
   const [tcpaConsent, setTcpaConsent] = useState<boolean>(false);
   const [hipaaConsent, setHipaaConsent] = useState<boolean>(false);
-  const [cancellationPolicyAcknowledged, setCancellationPolicyAcknowledged] = useState<boolean>(true);
+  const [unpaidCancellationFee, setUnpaidCancellationFee] = useState<number>(0);
+  const [isCheckingFee, setIsCheckingFee] = useState<boolean>(false);
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
 
   // Confirmed booking state
@@ -130,8 +132,8 @@ export const Booking: React.FC = () => {
   // Calculate products total
   const productsTotal = localProducts.reduce((sum, item) => sum + item.product.price * item.quantity, 0);
 
-  // Grand Total Cash Due
-  const grandCashTotal = servicesPriceTotal + productsTotal;
+  // Grand Total Cash Due (Services + Products + Previous $10 Late Cancellation Fee if applicable)
+  const grandCashTotal = servicesPriceTotal + productsTotal + unpaidCancellationFee;
 
   // Toggle service selection
   const handleToggleService = (serviceId: string) => {
@@ -178,23 +180,37 @@ export const Booking: React.FC = () => {
   };
 
   // Navigation between steps
-  const goToNextStep = () => {
+  const goToNextStep = async () => {
     if (step === 1 && selectedServiceIds.length === 0) {
-      alert("Please select at least one dental service.");
+      showToast("Please select at least one dental service.", "error");
       return;
     }
     if (step === 2 && (!selectedDate || !selectedTimeSlot)) {
-      alert("Please select a date and an available appointment time slot.");
+      showToast("Please select a date and an available appointment time slot.", "error");
       return;
     }
     if (step === 4) {
-      if (!patientName.trim()) {
-        alert("Please enter your Full Name.");
+      if (!patientName.trim() || patientName.trim().length < 2) {
+        showToast("Please enter your Full Legal Name (at least 2 characters).", "error");
         return;
       }
       if (!isValidUSPhone(rawPhone)) {
-        alert("Please enter a valid 10-digit U.S. mobile phone number (+1).");
+        showToast("Please enter a valid 10-digit U.S. mobile phone number (+1).", "error");
         return;
+      }
+      // Look up any unpaid $10 late cancellation fee from Cloud Firestore
+      setIsCheckingFee(true);
+      try {
+        const feeStatus = await getPatientCancellationFee(rawPhone);
+        setUnpaidCancellationFee(feeStatus.hasFee ? feeStatus.feeAmount : 0);
+        if (feeStatus.hasFee) {
+          showToast(`Notice: A previous $${feeStatus.feeAmount} late cancellation balance was added to your visit estimate.`, "info");
+        }
+      } catch (err) {
+        console.warn("Cancellation fee lookup notice:", err);
+        setUnpaidCancellationFee(0);
+      } finally {
+        setIsCheckingFee(false);
       }
     }
     setStep((prev) => (prev + 1) as any);
@@ -209,7 +225,7 @@ export const Booking: React.FC = () => {
     e.preventDefault();
 
     if (!tcpaConsent || !hipaaConsent) {
-      alert("Please agree to the mandatory TCPA SMS opt-in and HIPAA privacy terms to confirm your appointment.");
+      showToast("Please agree to the mandatory TCPA SMS opt-in and HIPAA privacy terms to confirm your appointment.", "error");
       return;
     }
 
@@ -240,10 +256,11 @@ export const Booking: React.FC = () => {
       services: bookedServices,
       products: bookedProducts,
       totalCash: grandCashTotal,
+      lateFeeIncluded: unpaidCancellationFee,
       practitioner,
       date: selectedDate,
       timeSlot: selectedTimeSlot,
-      insuranceProvider: "Direct Cash Pay (Dr. Qado Fee Schedule)",
+      insuranceProvider: "Cash Only (Dr. Qado Fee Schedule)",
       isNewPatient,
       tcpaConsent: true,
       hipaaConsent: true,
@@ -828,11 +845,25 @@ export const Booking: React.FC = () => {
 
               <button
                 type="button"
+                disabled={isCheckingFee}
                 onClick={goToNextStep}
-                className="px-6 py-3.5 text-sm font-semibold text-white bg-slate-900 hover:bg-teal-700 rounded-xl transition-colors inline-flex items-center gap-2 cursor-pointer"
+                className={`px-6 py-3.5 text-sm font-semibold text-white rounded-xl transition-colors inline-flex items-center gap-2 ${
+                  isCheckingFee
+                    ? 'bg-slate-500 cursor-wait opacity-80'
+                    : 'bg-slate-900 hover:bg-teal-700 cursor-pointer'
+                }`}
               >
-                <span>Review Consent & Summary</span>
-                <ChevronRight className="w-4 h-4" />
+                {isCheckingFee ? (
+                  <>
+                    <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                    <span>Checking Account...</span>
+                  </>
+                ) : (
+                  <>
+                    <span>Review Consent & Summary</span>
+                    <ChevronRight className="w-4 h-4" />
+                  </>
+                )}
               </button>
             </div>
           </div>
@@ -893,6 +924,16 @@ export const Booking: React.FC = () => {
                       <span className="font-bold tabular-nums">${(item.product.price * item.quantity).toFixed(2)}</span>
                     </div>
                   ))}
+                </div>
+              )}
+
+              {/* Previous $10 Late Cancellation Balance if present */}
+              {unpaidCancellationFee > 0 && (
+                <div className="space-y-1 text-xs pt-2 border-t border-amber-200 bg-amber-50/70 -mx-2 px-2 py-2 rounded-lg">
+                  <div className="flex justify-between items-center text-amber-900">
+                    <span className="font-semibold">Previous Late Cancellation Fee (&lt;24h policy)</span>
+                    <span className="font-bold tabular-nums">${unpaidCancellationFee.toFixed(2)}</span>
+                  </div>
                 </div>
               )}
 
@@ -1070,7 +1111,7 @@ export const Booking: React.FC = () => {
                 ${confirmedBooking.totalCash.toFixed(2)}
               </p>
               <p className="text-[11px] text-slate-500">
-                Payment accepted via Cash, Debit/Credit Card, HSA/FSA, or CareCredit.
+                All clinic services and oral care products are paid in cash at the front desk upon visit completion.
               </p>
             </div>
 

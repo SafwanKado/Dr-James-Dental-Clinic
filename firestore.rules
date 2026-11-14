@@ -25,14 +25,18 @@ service cloud.firestore {
     }
 
     function isValidId(id) {
-      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-\\+\\(\\)\\.\\ ]+$');
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
 
-    // Verified Doctor / Staff Administrator check
+    // Verified Doctor / Staff Administrator check (Email Spoofing Guard: requires email_verified == true)
     function isAdmin() {
       return isSignedIn() && (
-        request.auth.token.email == 'safwankado13@gmail.com' ||
-        request.auth.token.email.matches('.*@qadodental\\.com$') ||
+        (
+          request.auth.token.email_verified == true && (
+            request.auth.token.email == 'safwankado13@gmail.com' ||
+            request.auth.token.email.matches('.*@qadodental\\.com$')
+          )
+        ) ||
         exists(/databases/$(database)/documents/staff_roles/$(request.auth.uid))
       );
     }
@@ -52,72 +56,139 @@ service cloud.firestore {
         'status',
         'totalCashEstimated',
         'tcpaConsent',
-        'hipaaConsent'
+        'hipaaConsent',
+        'createdAt'
       ]) &&
+      data.keys().hasOnly([
+        'id',
+        'patientName',
+        'phoneNumber',
+        'email',
+        'services',
+        'selectedProducts',
+        'appointmentDate',
+        'timeSlot',
+        'status',
+        'totalCashEstimated',
+        'lateFeeIncluded',
+        'tcpaConsent',
+        'hipaaConsent',
+        'practitioner',
+        'notes',
+        'confirmationCode',
+        'isNewPatient',
+        'createdAt',
+        'lastUpdated'
+      ]) &&
+      (!('id' in data) || (data.id is string && data.id.size() <= 128)) &&
       data.patientName is string && data.patientName.size() >= 2 && data.patientName.size() <= 100 &&
       data.phoneNumber is string && data.phoneNumber.size() >= 10 && data.phoneNumber.size() <= 25 &&
-      data.appointmentDate is string && data.appointmentDate.size() <= 12 &&
-      data.timeSlot is string && data.timeSlot.size() <= 20 &&
+      (!('email' in data) || (data.email is string && data.email.size() <= 120)) &&
+      data.services is list && data.services.size() >= 1 && data.services.size() <= 10 &&
+      (!('selectedProducts' in data) || (data.selectedProducts is list && data.selectedProducts.size() <= 20)) &&
+      data.appointmentDate is string && data.appointmentDate.size() == 10 &&
+      data.timeSlot is string && data.timeSlot.size() >= 4 && data.timeSlot.size() <= 20 &&
       data.status in ['confirmed', 'in_chair', 'completed', 'cancelled'] &&
-      data.totalCashEstimated is number && data.totalCashEstimated >= 0 &&
+      data.totalCashEstimated is number && data.totalCashEstimated >= 0 && data.totalCashEstimated <= 50000 &&
+      (!('lateFeeIncluded' in data) || (data.lateFeeIncluded is number && data.lateFeeIncluded >= 0 && data.lateFeeIncluded <= 100)) &&
       // Mandatory TCPA and HIPAA regulatory consents
       data.tcpaConsent == true &&
       data.hipaaConsent == true &&
-      data.services is list && data.services.size() >= 1 && data.services.size() <= 10;
+      (!('practitioner' in data) || (data.practitioner is string && data.practitioner.size() <= 100)) &&
+      (!('notes' in data) || (data.notes is string && data.notes.size() <= 1000)) &&
+      (!('confirmationCode' in data) || (data.confirmationCode is string && data.confirmationCode.size() <= 20)) &&
+      (!('isNewPatient' in data) || data.isNewPatient is bool) &&
+      data.createdAt is timestamp &&
+      (!('lastUpdated' in data) || data.lastUpdated is timestamp);
     }
 
     match /appointments/{appointmentId} {
-      // Single appointment lookup: Staff or matching appointment ID
-      allow get: if isValidId(appointmentId) && (isAdmin() || !isSignedIn());
-
-      // Staff query listing: HIPAA mandates restricting bulk patient PHI to authenticated staff
+      // Single appointment lookup & listing restricted to verified clinic staff
+      allow get: if isValidId(appointmentId) && isAdmin();
       allow list: if isAdmin();
 
-      // Public Patient Booking: Allows patients to book with mandatory TCPA and HIPAA consent validation
+      // Public Patient Booking: Allows patients to book with mandatory TCPA/HIPAA consent & server time
       allow create: if isValidId(appointmentId) &&
                        isValidAppointment(incoming()) &&
-                       incoming().status == 'confirmed';
+                       incoming().status == 'confirmed' &&
+                       incoming().createdAt == request.time;
 
-      // Updates restricted to clinic staff (/doctor portal)
+      // Updates restricted to clinic staff (/doctor portal) with immutable createdAt and server lastUpdated
       allow update: if isValidId(appointmentId) &&
                        isAdmin() &&
-                       isValidAppointment(incoming());
+                       isValidAppointment(incoming()) &&
+                       incoming().createdAt == existing().createdAt &&
+                       (!('lastUpdated' in incoming()) || incoming().lastUpdated == request.time) &&
+                       incoming().diff(existing()).affectedKeys().hasOnly([
+                         'status',
+                         'lastUpdated',
+                         'notes',
+                         'totalCashEstimated',
+                         'selectedProducts',
+                         'services',
+                         'appointmentDate',
+                         'timeSlot',
+                         'practitioner'
+                       ]);
 
       // Deletions restricted strictly to clinic administrator
       allow delete: if isValidId(appointmentId) && isAdmin();
     }
 
     // =========================================================================
-    // 3. PATIENTS COLLECTION (/patients/{phoneNumber})
-    //    Document key is normalized phone number.
-    //    Allows patient fee lookup prior to booking and staff management.
+    // 3. PATIENTS COLLECTION (/patients/{patientId})
+    //    Document key is normalized phone digits (e.g., 15552348901).
+    //    Allows single-doc fee lookup prior to booking; roster list/updates for staff only.
     // =========================================================================
     function isValidPatient(data) {
-      return data.keys().hasAll(['phoneNumber', 'fullName', 'unpaidCancellationFee', 'feeAmount']) &&
-             data.phoneNumber is string && data.phoneNumber.size() >= 10 && data.phoneNumber.size() <= 25 &&
-             data.fullName is string && data.fullName.size() >= 2 && data.fullName.size() <= 100 &&
-             data.unpaidCancellationFee is bool &&
-             data.feeAmount is number && data.feeAmount >= 0;
+      return data.keys().hasAll([
+        'phoneNumber',
+        'fullName',
+        'unpaidCancellationFee',
+        'feeAmount',
+        'lastUpdated'
+      ]) &&
+      data.keys().hasOnly([
+        'phoneNumber',
+        'fullName',
+        'unpaidCancellationFee',
+        'feeAmount',
+        'lastUpdated',
+        'notes'
+      ]) &&
+      data.phoneNumber is string && data.phoneNumber.size() >= 10 && data.phoneNumber.size() <= 25 &&
+      data.fullName is string && data.fullName.size() >= 2 && data.fullName.size() <= 100 &&
+      data.unpaidCancellationFee is bool &&
+      data.feeAmount is number && data.feeAmount >= 0 && data.feeAmount <= 500 &&
+      data.lastUpdated is timestamp &&
+      (!('notes' in data) || (data.notes is string && data.notes.size() <= 1000));
     }
 
-    match /patients/{phoneNumber} {
-      // Patient fee lookup by exact phone number document key
-      allow get: if isValidId(phoneNumber);
+    match /patients/{patientId} {
+      // Exact single-document fee lookup by normalized phone digits
+      allow get: if isValidId(patientId);
 
       // Blanket patient list is restricted to clinic staff to protect patient roster
       allow list: if isAdmin();
 
-      // Create or update during appointment creation or by staff
-      allow create: if isValidId(phoneNumber) && isValidPatient(incoming());
+      // Create initial patient profile during booking (cannot spoof unpaid fee unless admin)
+      allow create: if isValidId(patientId) &&
+                       isValidPatient(incoming()) &&
+                       incoming().lastUpdated == request.time &&
+                       (isAdmin() || (incoming().unpaidCancellationFee == false && incoming().feeAmount == 0));
 
-      // Fee status update (e.g. marking $10 fee paid or assessing late cancellation)
-      allow update: if isValidId(phoneNumber) && (
-        isAdmin() ||
-        (
-          isValidPatient(incoming()) &&
-          incoming().diff(existing()).affectedKeys().hasOnly(['lastUpdated', 'unpaidCancellationFee', 'feeAmount'])
-        )
-      );
+      // Only clinic staff (or backend Admin SDK) can mark fees paid or assess a $10 cancellation fee
+      allow update: if isValidId(patientId) &&
+                       isAdmin() &&
+                       isValidPatient(incoming()) &&
+                       incoming().lastUpdated == request.time &&
+                       incoming().diff(existing()).affectedKeys().hasOnly([
+                         'fullName',
+                         'unpaidCancellationFee',
+                         'feeAmount',
+                         'lastUpdated',
+                         'notes'
+                       ]);
 
       // No deletion allowed
       allow delete: if false;
@@ -126,24 +197,29 @@ service cloud.firestore {
     // =========================================================================
     // 4. AUDIT LOGS COLLECTION (/audit_logs/{logId})
     //    MANDATORY HIPAA AUDIT TRAIL (§ 164.312(b)): Append-Only & Immutable
-    //    Logs CREATE, CANCEL, and MARK_PAID actions. No updates or deletions allowed.
     // =========================================================================
     function isValidAuditLog(data) {
       return data.keys().hasAll(['timestamp', 'action', 'performedBy', 'patientId']) &&
-             data.timestamp is string && data.timestamp.size() <= 40 &&
+             data.keys().hasOnly(['id', 'timestamp', 'action', 'performedBy', 'patientId', 'ipAddress', 'details']) &&
+             (!('id' in data) || (data.id is string && data.id.size() <= 128)) &&
+             data.timestamp == request.time &&
              data.action in ['CREATE', 'CANCEL', 'MARK_PAID', 'STATUS_CHANGE'] &&
-             data.performedBy is string && data.performedBy.size() <= 100 &&
-             data.patientId is string && data.patientId.size() <= 50;
+             data.performedBy is string && data.performedBy.size() >= 1 && data.performedBy.size() <= 100 &&
+             data.patientId is string && data.patientId.size() >= 1 && data.patientId.size() <= 50 &&
+             (!('ipAddress' in data) || (data.ipAddress is string && data.ipAddress.size() <= 50)) &&
+             (!('details' in data) || data.details is map);
     }
 
     match /audit_logs/{logId} {
-      // Append-Only: Public booking and staff actions can write audit logs
-      allow create: if isValidId(logId) && isValidAuditLog(incoming());
+      // Append-Only: Patients can log booking CREATE events; clinic staff can log all actions
+      allow create: if isValidId(logId) &&
+                       isValidAuditLog(incoming()) &&
+                       (isAdmin() || incoming().action == 'CREATE');
 
       // Read restricted exclusively to clinic staff and compliance officers
-      allow read: if isAdmin();
+      allow get, list: if isAdmin();
 
-      // STRICT IMMUTABILITY: Updating or deleting audit logs is forbidden by federal law
+      // STRICT IMMUTABILITY: Updating or deleting audit logs is forbidden
       allow update, delete: if false;
     }
 
@@ -151,8 +227,9 @@ service cloud.firestore {
     // 5. STAFF ROLES COLLECTION (/staff_roles/{userId})
     // =========================================================================
     match /staff_roles/{userId} {
-      allow read: if isSignedIn();
-      allow write: if isAdmin();
+      allow get: if isValidId(userId) && (isAdmin() || (isSignedIn() && request.auth.uid == userId));
+      allow list: if isAdmin();
+      allow write: if false;
     }
   }
 }

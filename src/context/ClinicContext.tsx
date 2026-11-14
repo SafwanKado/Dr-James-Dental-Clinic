@@ -4,7 +4,22 @@
  */
 
 import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
-import { Appointment, getStoredAppointments, createAppointment, updateAppointmentStatus, deleteAppointment } from '../services/appointmentService';
+import { onAuthStateChanged, User } from 'firebase/auth';
+import {
+  auth,
+  signInDoctorWithGoogle,
+  signOutDoctor,
+  subscribeToAppointments
+} from '../firebase';
+import {
+  Appointment,
+  getStoredAppointments,
+  createAppointment,
+  updateAppointmentStatus,
+  deleteAppointment,
+  mapFirestoreToAppointment,
+  saveAppointments
+} from '../services/appointmentService';
 import { DentalProduct } from '../utils/constants';
 
 interface CartItem {
@@ -38,14 +53,18 @@ interface ClinicContextType {
   preselectedServiceId: string | null;
   setPreselectedServiceId: (id: string | null) => void;
   isDoctorAuthenticated: boolean;
+  firebaseUser: User | null;
+  isAuthReady: boolean;
+  isFirestoreSynced: boolean;
   loginDoctor: (pin: string) => boolean;
+  loginDoctorWithGoogle: () => Promise<boolean>;
   logoutDoctor: () => void;
 }
 
 const ClinicContext = createContext<ClinicContextType | undefined>(undefined);
 
 export const ClinicProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
-  const [appointments, setAppointments] = useState<Appointment[]>([]);
+  const [appointments, setAppointments] = useState<Appointment[]>(() => getStoredAppointments());
   const [cart, setCart] = useState<CartItem[]>([]);
   const [visitRecordItems, setVisitRecordItems] = useState<{ product: DentalProduct; quantity: number }[]>(() => {
     try {
@@ -57,9 +76,14 @@ export const ClinicProvider: React.FC<{ children: ReactNode }> = ({ children }) 
   });
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [preselectedServiceId, setPreselectedServiceId] = useState<string | null>(null);
-  const [isDoctorAuthenticated, setIsDoctorAuthenticated] = useState<boolean>(() => {
+  const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
+  const [isAuthReady, setIsAuthReady] = useState<boolean>(false);
+  const [isFirestoreSynced, setIsFirestoreSynced] = useState<boolean>(false);
+  const [isPinAuthenticated, setIsPinAuthenticated] = useState<boolean>(() => {
     return sessionStorage.getItem('dr_qado_auth') === 'true';
   });
+
+  const isDoctorAuthenticated = Boolean(firebaseUser) || isPinAuthenticated;
 
   useEffect(() => {
     try {
@@ -69,10 +93,37 @@ export const ClinicProvider: React.FC<{ children: ReactNode }> = ({ children }) 
     }
   }, [visitRecordItems]);
 
-
+  // Listen to Firebase Auth state changes
   useEffect(() => {
-    setAppointments(getStoredAppointments());
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      setFirebaseUser(user);
+      setIsAuthReady(true);
+    });
+    return () => unsubscribe();
   }, []);
+
+  // Attach live Firestore onSnapshot listener only when auth is ready and staff user is signed in
+  useEffect(() => {
+    if (!isAuthReady || !firebaseUser) {
+      setIsFirestoreSynced(false);
+      return;
+    }
+
+    const unsubscribe = subscribeToAppointments(
+      (cloudList) => {
+        const mapped = cloudList.map(mapFirestoreToAppointment);
+        setAppointments(mapped);
+        saveAppointments(mapped);
+        setIsFirestoreSynced(true);
+      },
+      (error) => {
+        console.warn('Firestore listener notice:', error);
+        setIsFirestoreSynced(false);
+      }
+    );
+
+    return () => unsubscribe();
+  }, [isAuthReady, firebaseUser]);
 
   const showToast = (message: string, type: 'success' | 'info' | 'error' = 'success') => {
     const id = Math.random().toString(36).substring(2, 9);
@@ -84,7 +135,7 @@ export const ClinicProvider: React.FC<{ children: ReactNode }> = ({ children }) 
 
   const handleBookAppointment = (data: Omit<Appointment, 'id' | 'confirmationCode' | 'createdAt' | 'status'>) => {
     const newApt = createAppointment(data);
-    setAppointments(getStoredAppointments());
+    setAppointments(prev => [newApt, ...prev]);
     showToast(`Appointment confirmed! Booking Ref: ${newApt.confirmationCode}`);
     return newApt;
   };
@@ -150,9 +201,8 @@ export const ClinicProvider: React.FC<{ children: ReactNode }> = ({ children }) 
   const visitRecordCount = visitRecordItems.reduce((sum, item) => sum + item.quantity, 0);
 
   const loginDoctor = (pin: string) => {
-    // Default PIN: 1234 or direct access
     if (pin.trim() === '1234' || pin.trim() === '9911' || pin.trim() === 'doctor') {
-      setIsDoctorAuthenticated(true);
+      setIsPinAuthenticated(true);
       sessionStorage.setItem('dr_qado_auth', 'true');
       showToast("Welcome back, Dr. Qado. Provider Portal unlocked.");
       return true;
@@ -161,9 +211,26 @@ export const ClinicProvider: React.FC<{ children: ReactNode }> = ({ children }) 
     return false;
   };
 
+  const loginDoctorWithGoogle = async (): Promise<boolean> => {
+    try {
+      const user = await signInDoctorWithGoogle();
+      setIsPinAuthenticated(true);
+      sessionStorage.setItem('dr_qado_auth', 'true');
+      showToast(`Signed in with Google (${user.email}). Live Cloud Firestore sync active.`);
+      return true;
+    } catch (error) {
+      console.error('Google Sign-In failed:', error);
+      showToast('Google Sign-In could not be completed. Please try again or use your staff PIN.', 'error');
+      return false;
+    }
+  };
+
   const logoutDoctor = () => {
-    setIsDoctorAuthenticated(false);
+    setIsPinAuthenticated(false);
     sessionStorage.removeItem('dr_qado_auth');
+    if (firebaseUser) {
+      signOutDoctor().catch(console.error);
+    }
     showToast("Logged out of Provider Portal.", "info");
   };
 
@@ -189,7 +256,11 @@ export const ClinicProvider: React.FC<{ children: ReactNode }> = ({ children }) 
         preselectedServiceId,
         setPreselectedServiceId,
         isDoctorAuthenticated,
+        firebaseUser,
+        isAuthReady,
+        isFirestoreSynced,
         loginDoctor,
+        loginDoctorWithGoogle,
         logoutDoctor
       }}
     >

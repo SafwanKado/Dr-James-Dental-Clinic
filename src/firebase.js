@@ -7,9 +7,14 @@
 export {
   db,
   auth,
+  signInDoctorWithGoogle,
+  signOutDoctor,
+  normalizePhoneDocId,
+  subscribeToAppointments,
   createAppointmentInFirestore,
   getPatientCancellationFee,
   updateAppointmentStatusInFirestore,
+  deleteAppointmentInFirestore,
   markPatientFeePaidInFirestore,
   handleFirestoreError
 } from './firebase.ts';

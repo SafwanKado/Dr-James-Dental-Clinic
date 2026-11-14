@@ -25,31 +25,35 @@ export interface FirestoreAppointment {
   id: string;
   patientName: string;
   phoneNumber: string; // Standardized +1 (XXX) XXX-XXXX
+  email?: string;
   services: BookedService[];
   selectedProducts: BookedProduct[];
   appointmentDate: string; // YYYY-MM-DD
   timeSlot: string; // e.g., "10:00 AM"
   status: 'confirmed' | 'in_chair' | 'completed' | 'cancelled';
   totalCashEstimated: number; // e.g., 80.00
+  lateFeeIncluded?: number;
   tcpaConsent: boolean; // Must be true
   hipaaConsent: boolean; // Must be true
   practitioner?: string;
   notes?: string;
   confirmationCode?: string;
-  createdAt: string; // ISO String or Firestore ServerTimestamp
+  isNewPatient?: boolean;
+  createdAt: any; // Firestore ServerTimestamp or ISO String
+  lastUpdated?: any;
 }
 
 /**
  * Cloud Firestore Patients Model
- * Path: /patients/{phoneNumber}
- * Document ID: standardized phoneNumber (e.g., +15552348901)
+ * Path: /patients/{patientId}
+ * Document ID: normalized phone digits (e.g., 15552348901)
  */
 export interface FirestorePatient {
-  phoneNumber: string; // Document ID
+  phoneNumber: string;
   fullName: string;
   unpaidCancellationFee: boolean; // True if patient owes $10 late cancellation fee
-  feeAmount: number; // Defaults to 10.00
-  lastUpdated: string;
+  feeAmount: number; // Defaults to 10.00 when flagged, 0 otherwise
+  lastUpdated: any;
   notes?: string;
 }
 
@@ -60,10 +64,10 @@ export interface FirestorePatient {
  */
 export interface FirestoreAuditLog {
   id?: string;
-  timestamp: string; // ISO String or Firestore ServerTimestamp
+  timestamp: any; // Firestore ServerTimestamp or ISO String
   action: 'CREATE' | 'CANCEL' | 'MARK_PAID' | 'STATUS_CHANGE';
   performedBy: string; // 'patient', staff email, or user UID
-  patientId: string; // Phone number or patient reference key
+  patientId: string; // Normalized phone ID or patient reference key
   ipAddress: string; // Client IP or 'unknown'
   details?: Record<string, any>;
 }
@@ -86,5 +90,12 @@ export interface FirestoreErrorInfo {
     email?: string | null;
     emailVerified?: boolean | null;
     isAnonymous?: boolean | null;
+    tenantId?: string | null;
+    providerInfo?: {
+      providerId?: string | null;
+      displayName?: string | null;
+      email?: string | null;
+      photoUrl?: string | null;
+    }[];
   };
 }

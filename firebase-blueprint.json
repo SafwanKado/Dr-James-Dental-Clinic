@@ -7,7 +7,8 @@
       "properties": {
         "id": {
           "type": "string",
-          "description": "Unique appointment identifier"
+          "description": "Unique appointment identifier",
+          "maxLength": 128
         },
         "patientName": {
           "type": "string",
@@ -19,7 +20,13 @@
           "type": "string",
           "description": "Standardized U.S. mobile phone number (+1)",
           "minLength": 10,
-          "maxLength": 20
+          "maxLength": 25
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "Optional patient email address",
+          "maxLength": 120
         },
         "services": {
           "type": "array",
@@ -32,11 +39,13 @@
         "appointmentDate": {
           "type": "string",
           "description": "Scheduled date in YYYY-MM-DD format",
+          "minLength": 10,
           "maxLength": 10
         },
         "timeSlot": {
           "type": "string",
           "description": "Scheduled appointment time",
+          "minLength": 4,
           "maxLength": 20
         },
         "status": {
@@ -48,6 +57,10 @@
           "type": "number",
           "description": "Total cash fee expected at visit in USD"
         },
+        "lateFeeIncluded": {
+          "type": "number",
+          "description": "Outstanding $10 late cancellation fee included in estimate"
+        },
         "tcpaConsent": {
           "type": "boolean",
           "description": "Mandatory TCPA express consent for automated SMS communications"
@@ -56,9 +69,34 @@
           "type": "boolean",
           "description": "Mandatory acknowledgement of HIPAA privacy practices"
         },
+        "practitioner": {
+          "type": "string",
+          "description": "Assigned provider name",
+          "maxLength": 100
+        },
+        "notes": {
+          "type": "string",
+          "description": "Patient sensitivities or clinical notes",
+          "maxLength": 1000
+        },
+        "confirmationCode": {
+          "type": "string",
+          "description": "Short booking reference code",
+          "maxLength": 20
+        },
+        "isNewPatient": {
+          "type": "boolean",
+          "description": "Whether patient is new to the practice"
+        },
         "createdAt": {
           "type": "string",
-          "description": "Creation timestamp"
+          "format": "date-time",
+          "description": "Server creation timestamp"
+        },
+        "lastUpdated": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp"
         }
       },
       "required": [
@@ -70,22 +108,25 @@
         "status",
         "totalCashEstimated",
         "tcpaConsent",
-        "hipaaConsent"
+        "hipaaConsent",
+        "createdAt"
       ]
     },
     "Patient": {
       "title": "Patient",
-      "description": "Patient identity record indexed by U.S. phone number",
+      "description": "Patient identity record indexed by normalized U.S. phone digits",
       "type": "object",
       "properties": {
         "phoneNumber": {
           "type": "string",
-          "description": "Patient phone number document key",
-          "maxLength": 20
+          "description": "Patient phone number string",
+          "minLength": 10,
+          "maxLength": 25
         },
         "fullName": {
           "type": "string",
           "description": "Patient full legal name",
+          "minLength": 2,
           "maxLength": 100
         },
         "unpaidCancellationFee": {
@@ -98,14 +139,16 @@
         },
         "lastUpdated": {
           "type": "string",
-          "description": "Last modification timestamp"
+          "format": "date-time",
+          "description": "Last modification server timestamp"
         }
       },
       "required": [
         "phoneNumber",
         "fullName",
         "unpaidCancellationFee",
-        "feeAmount"
+        "feeAmount",
+        "lastUpdated"
       ]
     },
     "AuditLog": {
@@ -115,12 +158,13 @@
       "properties": {
         "timestamp": {
           "type": "string",
-          "description": "ISO timestamp of event occurrence"
+          "format": "date-time",
+          "description": "Server timestamp of event occurrence"
         },
         "action": {
           "type": "string",
           "description": "Event action type",
-          "enum": ["CREATE", "CANCEL", "MARK_PAID"]
+          "enum": ["CREATE", "CANCEL", "MARK_PAID", "STATUS_CHANGE"]
         },
         "performedBy": {
           "type": "string",
@@ -136,6 +180,10 @@
           "type": "string",
           "description": "Client IP address recorded at request time",
           "maxLength": 50
+        },
+        "details": {
+          "type": "object",
+          "description": "Structured event metadata"
         }
       },
       "required": [
@@ -151,7 +199,7 @@
       "schema": "Appointment",
       "description": "Publicly submittable patient appointments managed by clinic staff"
     },
-    "/patients/{phoneNumber}": {
+    "/patients/{patientId}": {
       "schema": "Patient",
       "description": "Patient records for late cancellation fee lookups"
     },

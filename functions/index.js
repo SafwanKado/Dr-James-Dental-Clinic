@@ -7,33 +7,65 @@ const { onDocumentCreated } = require("firebase-functions/v2/firestore");
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const { onRequest } = require("firebase-functions/v2/https");
 const logger = require("firebase-functions/logger");
-const admin = require("firebase-admin");
+const { initializeApp, getApps } = require("firebase-admin/app");
+const { getFirestore, FieldValue } = require("firebase-admin/firestore");
 const twilio = require("twilio");
 
-// Initialize Firebase Admin SDK
-if (!admin.apps.length) {
-  admin.initializeApp();
-}
-const db = admin.firestore();
+const FIRESTORE_DATABASE_ID =
+  process.env.FIRESTORE_DATABASE_ID ||
+  "ai-studio-drjamesqadodenta-f4085850-80c9-4199-abdf-00d09aee83b9";
+const FUNCTION_REGION = process.env.FUNCTION_REGION || "europe-west1";
 
-// Twilio Client Credentials from environment variables or Firebase config
-const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
-const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
-const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER || "";
-
-const twilioClient = TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN
-  ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-  : null;
+// Initialize Firebase Admin SDK bound to the provisioned named Firestore database
+const firebaseApp = getApps().length ? getApps()[0] : initializeApp();
+const db = getFirestore(firebaseApp, FIRESTORE_DATABASE_ID);
 
 /**
- * Normalizes phone number into E.164 string format (+1XXXXXXXXXX)
+ * Reads Twilio credentials securely from process.env at execution time.
+ * Never logs or exposes credential values.
+ */
+function getTwilioConfig() {
+  const accountSid = (process.env.TWILIO_ACCOUNT_SID || "").trim();
+  const authToken = (process.env.TWILIO_AUTH_TOKEN || "").trim();
+  const phoneNumber = normalizePhoneNumber((process.env.TWILIO_PHONE_NUMBER || "").trim()) ||
+    (process.env.TWILIO_PHONE_NUMBER || "").trim();
+
+  const missing = [];
+  if (!accountSid) missing.push("TWILIO_ACCOUNT_SID");
+  if (!authToken) missing.push("TWILIO_AUTH_TOKEN");
+  if (!phoneNumber) missing.push("TWILIO_PHONE_NUMBER");
+
+  if (missing.length > 0) {
+    return { client: null, fromNumber: "", missing };
+  }
+
+  return {
+    client: twilio(accountSid, authToken),
+    fromNumber: phoneNumber,
+    missing: []
+  };
+}
+
+/**
+ * Normalizes U.S. phone number into E.164 format (+1XXXXXXXXXX)
  */
 function normalizePhoneNumber(phone) {
-  if (!phone) return "";
+  if (!phone || typeof phone !== "string") return "";
   const digits = phone.replace(/\D/g, "");
   if (digits.length === 10) return `+1${digits}`;
   if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
-  return phone.startsWith("+") ? phone : `+${digits}`;
+  return "";
+}
+
+/**
+ * Normalizes phone number into alphanumeric document ID key (1XXXXXXXXXX)
+ */
+function normalizePhoneDocId(phone) {
+  if (!phone || typeof phone !== "string") return "10000000000";
+  const digits = phone.replace(/\D/g, "");
+  if (digits.length === 10) return `1${digits}`;
+  if (digits.length === 11 && digits.startsWith("1")) return digits;
+  return digits || "10000000000";
 }
 
 /**
@@ -43,11 +75,11 @@ async function appendAuditLog(action, performedBy, patientId, ipAddress, details
   try {
     const auditLogId = `audit-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
     await db.collection("audit_logs").doc(auditLogId).set({
-      timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      timestamp: FieldValue.serverTimestamp(),
       action,
       performedBy,
       patientId,
-      ipAddress: ipAddress || "twilio-webhook",
+      ipAddress: ipAddress || "cloud-functions",
       details
     });
   } catch (error) {
@@ -57,89 +89,122 @@ async function appendAuditLog(action, performedBy, patientId, ipAddress, details
 
 // =============================================================================
 // 1. sendBookingConfirmation (Firestore Trigger)
-//    Fires instantly whenever a new appointment document is created.
-//    Validates TCPA opt-in and sends confirmation SMS with visit date, time, and cash total.
+//    Fires whenever a new document is added to /appointments/{appointmentId}.
+//    Verifies TCPA SMS opt-in, sends privacy-safe confirmation SMS via Twilio,
+//    and updates the appointment record + HIPAA audit log.
 // =============================================================================
 exports.sendBookingConfirmation = onDocumentCreated(
-  "appointments/{appointmentId}",
+  {
+    document: "appointments/{appointmentId}",
+    database: FIRESTORE_DATABASE_ID,
+    region: FUNCTION_REGION
+  },
   async (event) => {
     const snap = event.data;
     if (!snap) {
-      logger.info("No data associated with the event");
+      logger.info("No document snapshot associated with the event.");
       return;
     }
 
     const appointment = snap.data();
     const appointmentId = event.params.appointmentId;
 
-    // TCPA Compliance Guard: Never send automated SMS without documented consent
-    if (!appointment.tcpaConsent) {
-      logger.warn(`Skipping SMS: TCPA consent missing for appointment ${appointmentId}`);
+    // Skip if confirmation SMS was already dispatched
+    if (appointment.confirmationSmsSent) {
+      logger.info(`Confirmation SMS already sent for appointment ${appointmentId}.`);
       return;
     }
 
-    const recipientPhone = normalizePhoneNumber(appointment.phoneNumber);
+    // TCPA Compliance Guard: Never send automated SMS without explicit consent
+    if (appointment.tcpaConsent !== true) {
+      logger.warn(`Skipping SMS: TCPA consent not granted for appointment ${appointmentId}.`);
+      return;
+    }
+
+    const recipientPhone = normalizePhoneNumber(appointment.phoneNumber || appointment.phone);
     if (!recipientPhone) {
-      logger.error(`Invalid phone number for appointment ${appointmentId}: ${appointment.phoneNumber}`);
+      logger.error(`Invalid U.S. phone number for appointment ${appointmentId}.`);
       return;
     }
 
-    // Format service names & cash total
-    const servicesList = Array.isArray(appointment.services)
-      ? appointment.services.map((s) => s.name).join(", ")
-      : appointment.serviceName || "Dental Examination";
+    const patientDocId = normalizePhoneDocId(recipientPhone);
+    const patientName = (appointment.patientName || appointment.name || "Valued Patient").trim();
+    const visitDate = appointment.appointmentDate || appointment.date || "Scheduled Date";
+    const visitTime = appointment.timeSlot || appointment.time || "Scheduled Time";
+    const cashTotal =
+      typeof appointment.totalCashEstimated === "number"
+        ? `$${appointment.totalCashEstimated.toFixed(2)}`
+        : "$80.00";
+    const refCode = appointment.confirmationCode ? ` (Ref: ${appointment.confirmationCode})` : "";
 
-    const cashTotal = typeof appointment.totalCashEstimated === "number"
-      ? `$${appointment.totalCashEstimated.toFixed(2)}`
-      : "$80.00";
-
+    // HIPAA Privacy-Safe SMS: Do not expose clinical diagnoses or detailed treatments
     const messageBody =
-      `Dr. James Qado Clinic: Hello ${appointment.patientName}, your dental visit is confirmed!\n\n` +
-      `• Date: ${appointment.appointmentDate}\n` +
-      `• Time: ${appointment.timeSlot}\n` +
-      `• Treatment: ${servicesList}\n` +
-      `• Total Cash Due: ${cashTotal}\n` +
-      `• Address: 742 Medical Plaza Pkwy, Suite 320, Beverly Hills, CA\n\n` +
-      `Please arrive 10 min early. Questions? Call (555) 382-7236. Reply STOP to unsubscribe.`;
+      `Dr. James Qado Dental Clinic: Hi ${patientName}, your visit${refCode} is confirmed!\n` +
+      `Date: ${visitDate}\n` +
+      `Time: ${visitTime}\n` +
+      `Estimated Cash Total (pay at desk): ${cashTotal}\n` +
+      `Location: 742 Medical Plaza Pkwy, Suite 320, Denver, CO 80202\n` +
+      `Please arrive 10 min early. Questions? Call (555) 382-7236. Reply STOP to opt out.`;
 
+    const { client: twilioClient, fromNumber, missing } = getTwilioConfig();
     if (!twilioClient) {
-      logger.warn("Twilio client not configured. Message simulated in test mode:", {
-        to: recipientPhone,
-        body: messageBody
+      logger.warn("Twilio credentials missing in environment; confirmation SMS skipped.", {
+        appointmentId,
+        missingEnvVars: missing
       });
+      await snap.ref.set(
+        {
+          confirmationSmsStatus: "SKIPPED_NO_TWILIO_CONFIG",
+          lastUpdated: FieldValue.serverTimestamp()
+        },
+        { merge: true }
+      );
       return;
     }
 
     try {
       const response = await twilioClient.messages.create({
         body: messageBody,
-        from: TWILIO_PHONE_NUMBER,
+        from: fromNumber,
         to: recipientPhone
       });
 
-      logger.info(`Booking confirmation SMS sent successfully: SID ${response.sid} to ${recipientPhone}`);
+      logger.info(`Booking confirmation SMS sent: SID ${response.sid} for appointment ${appointmentId}`);
 
-      // Record SMS dispatch in audit log
-      await appendAuditLog("CONFIRMATION_SMS_SENT", "system_trigger", recipientPhone, "cloud-functions", {
-        appointmentId,
-        messageSid: response.sid,
-        cashTotal
-      });
-
-      // Update appointment document with confirmation timestamp
       await snap.ref.set(
         {
           confirmationSmsSent: true,
+          confirmationSmsStatus: "SENT",
           confirmationSmsSid: response.sid,
-          confirmationSmsSentAt: admin.firestore.FieldValue.serverTimestamp()
+          confirmationSmsSentAt: FieldValue.serverTimestamp(),
+          lastUpdated: FieldValue.serverTimestamp()
         },
         { merge: true }
       );
-    } catch (error) {
-      logger.error(`Error sending booking confirmation SMS to ${recipientPhone}:`, error);
-      await appendAuditLog("CONFIRMATION_SMS_FAILED", "system_trigger", recipientPhone, "cloud-functions", {
+
+      await appendAuditLog("STATUS_CHANGE", "Twilio Booking Trigger", patientDocId, "cloud-functions", {
         appointmentId,
-        error: error.message
+        smsEvent: "CONFIRMATION_SMS_SENT",
+        messageSid: response.sid,
+        cashTotal
+      });
+    } catch (error) {
+      logger.error(`Error sending booking confirmation SMS for appointment ${appointmentId}:`, error);
+
+      await snap.ref.set(
+        {
+          confirmationSmsSent: false,
+          confirmationSmsStatus: "FAILED",
+          confirmationSmsError: error.message || "Twilio delivery error",
+          lastUpdated: FieldValue.serverTimestamp()
+        },
+        { merge: true }
+      );
+
+      await appendAuditLog("STATUS_CHANGE", "Twilio Booking Trigger", patientDocId, "cloud-functions", {
+        appointmentId,
+        smsEvent: "CONFIRMATION_SMS_FAILED",
+        error: error.message || "Unknown error"
       });
     }
   }
@@ -150,95 +215,85 @@ exports.sendBookingConfirmation = onDocumentCreated(
 //    Runs every hour to identify appointments scheduled ~24 hours ahead.
 //    Sends reminder with explicit 24h cancellation fee disclosure notice.
 // =============================================================================
-exports.send24HourReminder = onSchedule("every 1 hours", async (event) => {
-  logger.info("Executing scheduled 24-hour appointment reminder job...");
+exports.send24HourReminder = onSchedule(
+  {
+    schedule: "every 1 hours",
+    region: FUNCTION_REGION
+  },
+  async () => {
+    logger.info("Executing scheduled 24-hour appointment reminder job...");
 
-  const now = new Date();
-  // Target window: Tomorrow (24 hours from now)
-  const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
-  const targetDateString = tomorrow.toISOString().split("T")[0]; // YYYY-MM-DD
+    const now = new Date();
+    const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+    const targetDateString = tomorrow.toISOString().split("T")[0];
 
-  try {
-    const appointmentsSnapshot = await db
-      .collection("appointments")
-      .where("appointmentDate", "==", targetDateString)
-      .where("status", "==", "confirmed")
-      .get();
+    try {
+      const appointmentsSnapshot = await db
+        .collection("appointments")
+        .where("appointmentDate", "==", targetDateString)
+        .where("status", "==", "confirmed")
+        .get();
 
-    if (appointmentsSnapshot.empty) {
-      logger.info(`No confirmed appointments found for date ${targetDateString}`);
-      return;
-    }
-
-    logger.info(`Found ${appointmentsSnapshot.size} appointments scheduled for ${targetDateString}`);
-
-    for (const doc of appointmentsSnapshot.docs) {
-      const appointment = doc.data();
-
-      // Skip if reminder was already sent
-      if (appointment.reminder24hSent) {
-        continue;
+      if (appointmentsSnapshot.empty) {
+        logger.info(`No confirmed appointments found for date ${targetDateString}`);
+        return;
       }
 
-      // Check TCPA consent
-      if (!appointment.tcpaConsent) {
-        logger.warn(`Skipping reminder for appointment ${doc.id}: TCPA consent not granted.`);
-        continue;
-      }
-
-      const recipientPhone = normalizePhoneNumber(appointment.phoneNumber);
-      if (!recipientPhone) continue;
-
-      const reminderBody =
-        `Dr. James Qado Clinic Reminder: Your appointment is scheduled for tomorrow (${appointment.appointmentDate}) at ${appointment.timeSlot}.\n\n` +
-        `Reply CANCEL to cancel your visit. Note: Cancellations within 24h incur a $10 fee on your next visit.\n` +
-        `Address: 742 Medical Plaza Pkwy, Suite 320. Call (555) 382-7236 with any questions.`;
-
+      const { client: twilioClient, fromNumber, missing } = getTwilioConfig();
       if (!twilioClient) {
-        logger.warn("Twilio client unconfigured. Simulated 24h reminder:", {
-          to: recipientPhone,
-          body: reminderBody
+        logger.warn("Twilio credentials missing in environment; 24h reminders skipped.", {
+          missingEnvVars: missing
         });
-        await doc.ref.set(
-          {
-            reminder24hSent: true,
-            reminderSentAt: admin.firestore.FieldValue.serverTimestamp()
-          },
-          { merge: true }
-        );
-        continue;
+        return;
       }
 
-      try {
-        const response = await twilioClient.messages.create({
-          body: reminderBody,
-          from: TWILIO_PHONE_NUMBER,
-          to: recipientPhone
-        });
+      for (const docSnap of appointmentsSnapshot.docs) {
+        const appointment = docSnap.data();
 
-        logger.info(`24h reminder SMS sent to ${recipientPhone}, SID: ${response.sid}`);
+        if (appointment.reminder24hSent || appointment.tcpaConsent !== true) {
+          continue;
+        }
 
-        await doc.ref.set(
-          {
-            reminder24hSent: true,
-            reminderSentAt: admin.firestore.FieldValue.serverTimestamp(),
-            reminderMessageSid: response.sid
-          },
-          { merge: true }
-        );
+        const recipientPhone = normalizePhoneNumber(appointment.phoneNumber);
+        if (!recipientPhone) continue;
 
-        await appendAuditLog("REMINDER_24H_SMS_SENT", "scheduled_job", recipientPhone, "cloud-scheduler", {
-          appointmentId: doc.id,
-          messageSid: response.sid
-        });
-      } catch (smsError) {
-        logger.error(`Failed to send 24h reminder SMS to ${recipientPhone}:`, smsError);
+        const patientDocId = normalizePhoneDocId(recipientPhone);
+        const reminderBody =
+          `Dr. James Qado Dental Clinic Reminder: Your visit is tomorrow (${appointment.appointmentDate}) at ${appointment.timeSlot}.\n` +
+          `Reply CANCEL to cancel your visit. Note: Cancellations within 24h incur a $10 fee on your next visit.\n` +
+          `742 Medical Plaza Pkwy, Suite 320, Denver, CO. Call (555) 382-7236 with questions. Reply STOP to opt out.`;
+
+        try {
+          const response = await twilioClient.messages.create({
+            body: reminderBody,
+            from: fromNumber,
+            to: recipientPhone
+          });
+
+          await docSnap.ref.set(
+            {
+              reminder24hSent: true,
+              reminderSentAt: FieldValue.serverTimestamp(),
+              reminderMessageSid: response.sid,
+              lastUpdated: FieldValue.serverTimestamp()
+            },
+            { merge: true }
+          );
+
+          await appendAuditLog("STATUS_CHANGE", "Twilio 24h Scheduler", patientDocId, "cloud-scheduler", {
+            appointmentId: docSnap.id,
+            smsEvent: "REMINDER_24H_SMS_SENT",
+            messageSid: response.sid
+          });
+        } catch (smsError) {
+          logger.error(`Failed to send 24h reminder SMS for ${docSnap.id}:`, smsError);
+        }
       }
+    } catch (error) {
+      logger.error("Error running send24HourReminder job:", error);
     }
-  } catch (error) {
-    logger.error("Error running send24HourReminder job:", error);
   }
-});
+);
 
 // =============================================================================
 // 3. handleTwilioWebhook (HTTP Webhook Endpoint)
@@ -250,11 +305,31 @@ exports.send24HourReminder = onSchedule("every 1 hours", async (event) => {
 //      - Appends compliance record to audit_logs
 //      - Returns TwiML response to the patient
 // =============================================================================
-exports.handleTwilioWebhook = onRequest(async (req, res) => {
+exports.handleTwilioWebhook = onRequest({ region: FUNCTION_REGION }, async (req, res) => {
   // Enforce POST requests from Twilio
   if (req.method !== "POST") {
     res.status(405).send("Method Not Allowed");
     return;
+  }
+
+  // Validate Twilio X-Twilio-Signature when auth token is configured
+  const authToken = (process.env.TWILIO_AUTH_TOKEN || "").trim();
+  const twilioSignature = req.headers["x-twilio-signature"];
+  if (authToken && twilioSignature) {
+    const protocol = req.headers["x-forwarded-proto"] || req.protocol || "https";
+    const host = req.headers["x-forwarded-host"] || req.get("host");
+    const requestUrl = `${protocol}://${host}${req.originalUrl}`;
+    const isValidSignature = twilio.validateRequest(
+      authToken,
+      twilioSignature,
+      requestUrl,
+      req.body || {}
+    );
+    if (!isValidSignature) {
+      logger.warn("Rejected webhook request due to invalid Twilio signature.");
+      res.status(403).send("Forbidden");
+      return;
+    }
   }
 
   const twiml = new twilio.twiml.MessagingResponse();
@@ -265,8 +340,31 @@ exports.handleTwilioWebhook = onRequest(async (req, res) => {
 
   logger.info(`Received incoming Twilio SMS from ${normalizedSender}: "${incomingBody}"`);
 
+  const upperBody = incomingBody.toUpperCase();
+
+  // Handle standard U.S. A2P 10DLC carrier opt-out / help keywords
+  if (upperBody === "STOP" || upperBody === "UNSUBSCRIBE" || upperBody === "QUIT") {
+    await appendAuditLog("CANCEL", "Twilio SMS Opt-Out", normalizePhoneDocId(normalizedSender), clientIp, { keyword: upperBody });
+    res.type("text/xml").status(200).send(twiml.toString());
+    return;
+  }
+  if (upperBody === "HELP") {
+    twiml.message(
+      "Dr. James Qado Dental Clinic (Denver, CO): For scheduling or care help, call (555) 382-7236. Reply CANCEL to cancel an upcoming visit or STOP to opt out."
+    );
+    res.type("text/xml").status(200).send(twiml.toString());
+    return;
+  }
+  if (upperBody === "START") {
+    twiml.message(
+      "Dr. James Qado Dental Clinic: You are opted in for appointment reminders. Reply HELP for assistance or STOP to cancel alerts."
+    );
+    res.type("text/xml").status(200).send(twiml.toString());
+    return;
+  }
+
   // Handle CANCEL request
-  if (incomingBody.toUpperCase() === "CANCEL") {
+  if (upperBody === "CANCEL") {
     try {
       // Find the upcoming active confirmed appointment for this phone number
       const appointmentsRef = db.collection("appointments");
@@ -300,34 +398,36 @@ exports.handleTwilioWebhook = onRequest(async (req, res) => {
 
       const appointmentData = matchedDoc.data();
       const appointmentId = matchedDoc.id;
+      const patientDocId = normalizePhoneDocId(normalizedSender);
 
       // 1. Update appointment status to 'cancelled' and reopen slot
       await matchedDoc.ref.set(
         {
           status: "cancelled",
           cancelledVia: "TWILIO_SMS_WEBHOOK",
-          cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
+          cancelledAt: FieldValue.serverTimestamp(),
+          lastUpdated: FieldValue.serverTimestamp(),
           slotReopened: true
         },
         { merge: true }
       );
 
       // 2. Assess $10 Late Cancellation Fee on patient profile
-      const patientRef = db.collection("patients").doc(normalizedSender);
+      const patientRef = db.collection("patients").doc(patientDocId);
       await patientRef.set(
         {
           phoneNumber: normalizedSender,
           fullName: appointmentData.patientName || "Patient",
           unpaidCancellationFee: true,
           feeAmount: 10.0,
-          feeReason: "Late cancellation via SMS (<24h notice policy)",
-          lastUpdated: admin.firestore.FieldValue.serverTimestamp()
+          notes: "Late cancellation via SMS (<24h notice policy)",
+          lastUpdated: FieldValue.serverTimestamp()
         },
         { merge: true }
       );
 
       // 3. Append to immutable HIPAA audit log
-      await appendAuditLog("CANCEL", "Twilio SMS Webhook", normalizedSender, clientIp, {
+      await appendAuditLog("CANCEL", "Twilio SMS Webhook", patientDocId, clientIp, {
         appointmentId,
         appointmentDate: appointmentData.appointmentDate,
         timeSlot: appointmentData.timeSlot,
